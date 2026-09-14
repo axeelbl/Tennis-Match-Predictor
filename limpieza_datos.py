@@ -1,155 +1,234 @@
-import os
-import pandas as pd
+"""Build leakage-aware model features from chronological ATP match data."""
+
+from __future__ import annotations
+
+import argparse
 from collections import defaultdict, deque
+from pathlib import Path
+from typing import Any
 
-# ----------------------------------------
-# Cargar y limpiar datos
-# ----------------------------------------
-filename = "atp_matches_1968_2024_completo.csv"
-folder_path = '/Users/Stikets/Desktop/Axel/python/Data'
-full_path = os.path.join(folder_path, filename)
+import pandas as pd
 
-df = pd.read_csv(full_path)
-
-columnas_utiles = [
-    'tourney_date', 'surface', 'round', 'best_of', 'tourney_level',
-    'winner_name', 'winner_hand', 'winner_age', 'winner_rank',
-    'loser_name', 'loser_hand', 'loser_age', 'loser_rank',
-    'w_ace', 'w_df', 'w_1stWon', 'w_2ndWon',
-    'l_ace', 'l_df', 'l_1stWon', 'l_2ndWon'
+REQUIRED_COLUMNS = [
+    "tourney_date",
+    "surface",
+    "round",
+    "best_of",
+    "tourney_level",
+    "winner_name",
+    "winner_hand",
+    "winner_age",
+    "winner_rank",
+    "loser_name",
+    "loser_hand",
+    "loser_age",
+    "loser_rank",
+    "w_ace",
+    "w_df",
+    "w_1stWon",
+    "w_2ndWon",
+    "l_ace",
+    "l_df",
+    "l_1stWon",
+    "l_2ndWon",
 ]
-df = df[columnas_utiles].copy()
+NUMERIC_COLUMNS = [
+    "winner_rank",
+    "loser_rank",
+    "winner_age",
+    "loser_age",
+    "w_ace",
+    "w_df",
+    "w_1stWon",
+    "w_2ndWon",
+    "l_ace",
+    "l_df",
+    "l_1stWon",
+    "l_2ndWon",
+]
 
-# Limpieza básica
-df = df.dropna(subset=['winner_name', 'loser_name', 'surface', 'round'])
-valores_numericos = ['winner_rank', 'loser_rank', 'winner_age', 'loser_age',
-                     'w_ace', 'w_df', 'w_1stWon', 'w_2ndWon',
-                     'l_ace', 'l_df', 'l_1stWon', 'l_2ndWon']
-df[valores_numericos] = df[valores_numericos].fillna(0)
-df['winner_hand'] = df['winner_hand'].fillna('R')
-df['loser_hand'] = df['loser_hand'].fillna('R')
 
-# Ordenar por fecha para cálculos cronológicos
-df = df.sort_values("tourney_date").reset_index(drop=True)
+def calculate_elo(
+    elo_winner: float, elo_loser: float, k_factor: int = 32
+) -> tuple[float, float]:
+    """Return post-match Elo values for a winner and loser."""
+    expected_win = 1 / (1 + 10 ** ((elo_loser - elo_winner) / 400))
+    adjustment = k_factor * (1 - expected_win)
+    return elo_winner + adjustment, elo_loser - adjustment
 
-# ----------------------------------------
-# Calcular ELO
-# ----------------------------------------
-elo_dict = defaultdict(lambda: 1500)
-elo_winner_list = []
-elo_loser_list = []
 
-def calcular_elo(elo_w, elo_l, k=32):
-    expected_win = 1 / (1 + 10 ** ((elo_l - elo_w) / 400))
-    return elo_w + k * (1 - expected_win), elo_l - k * (1 - expected_win)
+def _validate_columns(matches: pd.DataFrame) -> None:
+    missing = sorted(set(REQUIRED_COLUMNS) - set(matches.columns))
+    if missing:
+        raise ValueError(f"Input CSV is missing required columns: {', '.join(missing)}")
 
-for _, row in df.iterrows():
-    w, l = row['winner_name'], row['loser_name']
-    ew, el = elo_dict[w], elo_dict[l]
-    elo_winner_list.append(ew)
-    elo_loser_list.append(el)
-    elo_dict[w], elo_dict[l] = calcular_elo(ew, el)
 
-df['elo_winner'] = elo_winner_list
-df['elo_loser'] = elo_loser_list
+def build_model_dataset(matches: pd.DataFrame, recent_window: int = 5) -> pd.DataFrame:
+    """Create two labelled perspectives per match using only pre-match statistics."""
+    if recent_window < 1:
+        raise ValueError("recent_window must be at least 1")
+    _validate_columns(matches)
 
-# ----------------------------------------
-# Head to Head
-# ----------------------------------------
-h2h_counter = defaultdict(int)
-h2h_winner_vs_loser = []
-h2h_loser_vs_winner = []
+    data = matches[REQUIRED_COLUMNS].copy()
+    data = data.dropna(subset=["winner_name", "loser_name", "surface", "round"])
+    if data.empty:
+        raise ValueError("No usable matches remain after removing incomplete rows")
 
-for _, row in df.iterrows():
-    w, l = row['winner_name'], row['loser_name']
-    h2h_winner_vs_loser.append(h2h_counter[(w, l)])
-    h2h_loser_vs_winner.append(h2h_counter[(l, w)])
-    h2h_counter[(w, l)] += 1
+    data[NUMERIC_COLUMNS] = data[NUMERIC_COLUMNS].apply(
+        pd.to_numeric, errors="coerce"
+    ).fillna(0)
+    data["winner_hand"] = data["winner_hand"].fillna("U")
+    data["loser_hand"] = data["loser_hand"].fillna("U")
+    data["tourney_level"] = data["tourney_level"].fillna("Unknown")
+    data = data.sort_values("tourney_date", kind="stable").reset_index(drop=True)
+    data["match_id"] = data.index
 
-df['h2h_winner_vs_loser'] = h2h_winner_vs_loser
-df['h2h_loser_vs_winner'] = h2h_loser_vs_winner
+    elo: defaultdict[str, float] = defaultdict(lambda: 1500.0)
+    elo_winner: list[float] = []
+    elo_loser: list[float] = []
+    for row in data.itertuples(index=False):
+        winner, loser = row.winner_name, row.loser_name
+        before_winner, before_loser = elo[winner], elo[loser]
+        elo_winner.append(before_winner)
+        elo_loser.append(before_loser)
+        elo[winner], elo[loser] = calculate_elo(before_winner, before_loser)
+    data["elo_winner"] = elo_winner
+    data["elo_loser"] = elo_loser
 
-# ----------------------------------------
-# Racha reciente
-# ----------------------------------------
-N = 5
-recent_results = defaultdict(lambda: deque(maxlen=N))
-recent_winner_wins = []
-recent_loser_wins = []
+    h2h: defaultdict[tuple[str, str], int] = defaultdict(int)
+    h2h_winner_vs_loser: list[int] = []
+    h2h_loser_vs_winner: list[int] = []
+    for row in data.itertuples(index=False):
+        winner, loser = row.winner_name, row.loser_name
+        h2h_winner_vs_loser.append(h2h[(winner, loser)])
+        h2h_loser_vs_winner.append(h2h[(loser, winner)])
+        h2h[(winner, loser)] += 1
+    data["h2h_winner_vs_loser"] = h2h_winner_vs_loser
+    data["h2h_loser_vs_winner"] = h2h_loser_vs_winner
 
-for _, row in df.iterrows():
-    w, l = row['winner_name'], row['loser_name']
-    recent_winner_wins.append(sum(recent_results[w]))
-    recent_loser_wins.append(sum(recent_results[l]))
-    recent_results[w].append(1)
-    recent_results[l].append(0)
+    recent: defaultdict[str, deque[int]] = defaultdict(
+        lambda: deque(maxlen=recent_window)
+    )
+    recent_winner_wins: list[int] = []
+    recent_loser_wins: list[int] = []
+    for row in data.itertuples(index=False):
+        winner, loser = row.winner_name, row.loser_name
+        recent_winner_wins.append(sum(recent[winner]))
+        recent_loser_wins.append(sum(recent[loser]))
+        recent[winner].append(1)
+        recent[loser].append(0)
+    data["recent_winner_wins"] = recent_winner_wins
+    data["recent_loser_wins"] = recent_loser_wins
 
-df['recent_winner_wins'] = recent_winner_wins
-df['recent_loser_wins'] = recent_loser_wins
+    ace_stats: defaultdict[str, dict[str, float]] = defaultdict(
+        lambda: {"aces": 0.0, "matches": 0.0}
+    )
+    ace_winner: list[float] = []
+    ace_loser: list[float] = []
 
-# ----------------------------------------
-# Superficie favorita
-# ----------------------------------------
-surface_stats = defaultdict(lambda: {'wins': 0, 'total': 0})
-surface_winner_wr = []
-surface_loser_wr = []
+    def average_aces(player: str) -> float:
+        stats = ace_stats[player]
+        return stats["aces"] / stats["matches"] if stats["matches"] else 0.0
 
-for _, row in df.iterrows():
-    s, w, l = row['surface'], row['winner_name'], row['loser_name']
-    def winrate(player):
-        stats = surface_stats[(player, s)]
-        return stats['wins'] / stats['total'] if stats['total'] > 0 else 0.5
-    surface_winner_wr.append(winrate(w))
-    surface_loser_wr.append(winrate(l))
-    surface_stats[(w, s)]['wins'] += 1
-    surface_stats[(w, s)]['total'] += 1
-    surface_stats[(l, s)]['total'] += 1
+    for row in data.itertuples(index=False):
+        winner, loser = row.winner_name, row.loser_name
+        ace_winner.append(average_aces(winner))
+        ace_loser.append(average_aces(loser))
+        ace_stats[winner]["aces"] += row.w_ace
+        ace_stats[winner]["matches"] += 1
+        ace_stats[loser]["aces"] += row.l_ace
+        ace_stats[loser]["matches"] += 1
+    data["ace_winner"] = ace_winner
+    data["ace_loser"] = ace_loser
 
-df['surface_winner_wr'] = surface_winner_wr
-df['surface_loser_wr'] = surface_loser_wr
+    surface_stats: defaultdict[tuple[str, str], dict[str, int]] = defaultdict(
+        lambda: {"wins": 0, "total": 0}
+    )
+    surface_winner_wr: list[float] = []
+    surface_loser_wr: list[float] = []
 
-# ----------------------------------------
-# Contexto del torneo
-# ----------------------------------------
-dummies_tourney = pd.get_dummies(df['tourney_level'], prefix='tourney')
-df = pd.concat([df.reset_index(drop=True), dummies_tourney.reset_index(drop=True)], axis=1)
-tourney_columns = dummies_tourney.columns.tolist()
+    def win_rate(player: str, surface: str) -> float:
+        stats = surface_stats[(player, surface)]
+        return stats["wins"] / stats["total"] if stats["total"] else 0.5
 
-# ----------------------------------------
-# Transformar a filas para el modelo
-# ----------------------------------------
-def crear_fila(p1, p2, row, target):
-    base = {
-        'p1_name': row[f'{p1}_name'], 'p2_name': row[f'{p2}_name'],
-        'p1_rank': row[f'{p1}_rank'], 'p2_rank': row[f'{p2}_rank'],
-        'p1_age': row[f'{p1}_age'], 'p2_age': row[f'{p2}_age'],
-        'p1_hand': row[f'{p1}_hand'], 'p2_hand': row[f'{p2}_hand'],
-        'p1_ace': row[f'{"w" if p1 == "winner" else "l"}_ace'],
-        'p2_ace': row[f'{"w" if p2 == "winner" else "l"}_ace'],
-        'elo_p1': row[f'elo_{p1}'], 'elo_p2': row[f'elo_{p2}'],
-        'h2h_p1_vs_p2': row[f'h2h_{p1}_vs_{p2}'],
-        'h2h_p2_vs_p1': row[f'h2h_{p2}_vs_{p1}'],
-        'p1_recent_wins': row[f'recent_{p1}_wins'],
-        'p2_recent_wins': row[f'recent_{p2}_wins'],
-        'p1_surface_wr': row[f'surface_{p1}_wr'],
-        'p2_surface_wr': row[f'surface_{p2}_wr'],
-        'target': target
-    }
-    for col in tourney_columns:
-        base[col] = row.get(col, 0)
-    return base
+    for row in data.itertuples(index=False):
+        surface, winner, loser = row.surface, row.winner_name, row.loser_name
+        surface_winner_wr.append(win_rate(winner, surface))
+        surface_loser_wr.append(win_rate(loser, surface))
+        surface_stats[(winner, surface)]["wins"] += 1
+        surface_stats[(winner, surface)]["total"] += 1
+        surface_stats[(loser, surface)]["total"] += 1
+    data["surface_winner_wr"] = surface_winner_wr
+    data["surface_loser_wr"] = surface_loser_wr
 
-filas = []
-for _, row in df.iterrows():
-    filas.append(crear_fila('winner', 'loser', row, 1))
-    filas.append(crear_fila('loser', 'winner', row, 0))
+    tournament_dummies = pd.get_dummies(
+        data["tourney_level"], prefix="tourney", dtype=int
+    )
+    data = pd.concat([data, tournament_dummies], axis=1)
+    tournament_columns = tournament_dummies.columns.tolist()
 
-df_modelo = pd.DataFrame(filas)
-df_modelo = df_modelo[df_modelo['p1_name'].notnull() & df_modelo['p2_name'].notnull()]
-df_modelo = df_modelo.reset_index(drop=True)
+    def create_row(p1: str, p2: str, match: pd.Series, target: int) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "match_id": match["match_id"],
+            "p1_name": match[f"{p1}_name"],
+            "p2_name": match[f"{p2}_name"],
+            "p1_rank": match[f"{p1}_rank"],
+            "p2_rank": match[f"{p2}_rank"],
+            "p1_age": match[f"{p1}_age"],
+            "p2_age": match[f"{p2}_age"],
+            "p1_hand": match[f"{p1}_hand"],
+            "p2_hand": match[f"{p2}_hand"],
+            "p1_ace": match[f"ace_{p1}"],
+            "p2_ace": match[f"ace_{p2}"],
+            "elo_p1": match[f"elo_{p1}"],
+            "elo_p2": match[f"elo_{p2}"],
+            "h2h_p1_vs_p2": match[f"h2h_{p1}_vs_{p2}"],
+            "h2h_p2_vs_p1": match[f"h2h_{p2}_vs_{p1}"],
+            "p1_recent_wins": match[f"recent_{p1}_wins"],
+            "p2_recent_wins": match[f"recent_{p2}_wins"],
+            "p1_surface_wr": match[f"surface_{p1}_wr"],
+            "p2_surface_wr": match[f"surface_{p2}_wr"],
+            "target": target,
+        }
+        result.update({column: match[column] for column in tournament_columns})
+        return result
 
-# ----------------------------------------
-# Guardar CSV
-# ----------------------------------------
-df_modelo.to_csv(os.path.join(folder_path, "tennis_model_dataset.csv"), index=False)
-print("✅ Archivo guardado en:", os.path.join(folder_path, "tennis_model_dataset.csv"))
+    rows: list[dict[str, Any]] = []
+    for _, match in data.iterrows():
+        rows.append(create_row("winner", "loser", match, 1))
+        rows.append(create_row("loser", "winner", match, 0))
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="Combined ATP match CSV produced by juntar_csv.py",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("tennis_model_dataset.csv"),
+        help="Feature dataset destination (default: tennis_model_dataset.csv)",
+    )
+    parser.add_argument("--recent-window", type=int, default=5)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    source = args.input.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Input CSV does not exist: {source}")
+
+    output = args.output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    model_data = build_model_dataset(pd.read_csv(source), args.recent_window)
+    model_data.to_csv(output, index=False)
+    print(f"Saved {len(model_data)} model rows to {output}")
+
+
+if __name__ == "__main__":
+    main()

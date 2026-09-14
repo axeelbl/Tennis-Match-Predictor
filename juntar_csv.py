@@ -1,36 +1,73 @@
+"""Combine yearly ATP match CSV files into one chronological dataset."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import pandas as pd
-import os
 
-# Ruta donde tienes guardados todos los archivos CSV
-folder_path = '/Users/Stikets/Desktop/Axel/python/Data'
 
-# Lista para guardar los DataFrames
-all_matches = []
+def combine_csv_files(
+    data_dir: Path, start_year: int = 1968, end_year: int = 2024
+) -> pd.DataFrame:
+    """Load available ``atp_matches_YEAR.csv`` files and combine their rows."""
+    if start_year > end_year:
+        raise ValueError("start_year must be less than or equal to end_year")
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Data directory does not exist: {data_dir}")
 
-# Cargar cada archivo CSV
-for year in range(1968, 2025):  # hasta 2024 inclusive
-    filename = f"atp_matches_{year}.csv"
-    full_path = os.path.join(folder_path, filename)
-    print("archivo encontrado: " + filename)
-    
-    if os.path.exists(full_path):
-        print("leyendo: " + filename)
-        df = pd.read_csv(full_path)
-        df['year'] = year  # para saber de qué año viene cada fila
-        all_matches.append(df)
-        print("leido y añadido: " + filename)
-    else:
-        print(f"⚠️ Archivo no encontrado: {filename}")
+    frames: list[pd.DataFrame] = []
+    for year in range(start_year, end_year + 1):
+        source = data_dir / f"atp_matches_{year}.csv"
+        if not source.is_file():
+            print(f"Skipping missing file: {source.name}")
+            continue
 
-# Combinar todo en un solo DataFrame
-print("combinando todo en uno ...")
-df_all = pd.concat(all_matches, ignore_index=True)
+        frame = pd.read_csv(source)
+        frame["year"] = year
+        frames.append(frame)
+        print(f"Loaded {source.name}: {len(frame)} matches")
 
-# Guardar el DataFrame combinado en un CSV
-output_path = os.path.join(folder_path, "atp_matches_1968_2024_completo.csv")
-df_all.to_csv(output_path, index=False)
-print("Archivo guardado en:", output_path)
+    if not frames:
+        raise FileNotFoundError(
+            f"No yearly ATP files found in {data_dir} for {start_year}-{end_year}"
+        )
 
-# Mostrar forma y columnas para verificar
-print("Número total de partidos:", df_all.shape[0])
-print("Columnas:", df_all.columns.tolist())
+    return pd.concat(frames, ignore_index=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help="Directory containing atp_matches_YEAR.csv files (default: data)",
+    )
+    parser.add_argument("--start-year", type=int, default=1968)
+    parser.add_argument("--end-year", type=int, default=2024)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output CSV (default: DATA_DIR/atp_matches_START_END_completo.csv)",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    data_dir = args.data_dir.expanduser().resolve()
+    output = args.output or data_dir / (
+        f"atp_matches_{args.start_year}_{args.end_year}_completo.csv"
+    )
+    output = output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    matches = combine_csv_files(data_dir, args.start_year, args.end_year)
+    matches.to_csv(output, index=False)
+    print(f"Saved {len(matches)} matches to {output}")
+
+
+if __name__ == "__main__":
+    main()
