@@ -4,6 +4,12 @@ A reproducible Python pipeline that combines yearly ATP match files, builds chro
 
 > This is an educational project, not a betting or financial decision system. Historical accuracy does not guarantee future performance.
 
+## Pipeline at a glance
+
+![Architecture diagram showing yearly ATP files flowing through combination, chronological pre-match feature engineering, and match-grouped Random Forest evaluation](docs/pipeline.svg)
+
+*The pipeline derives each feature from information available before the match, then keeps both labelled perspectives of that match in the same evaluation split.*
+
 ## What the pipeline does
 
 1. `juntar_csv.py` combines available `atp_matches_YEAR.csv` files.
